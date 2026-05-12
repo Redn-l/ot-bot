@@ -4,7 +4,7 @@ import threading
 import time
 from datetime import date, timedelta
 
-import psycopg2
+import psycopg as psycopg2
 import requests
 import schedule
 
