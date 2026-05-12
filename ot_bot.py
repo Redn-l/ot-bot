@@ -8,8 +8,6 @@ import psycopg as psycopg2
 import requests
 import schedule
 
-os.environ["PGCLIENTENCODING"] = "UTF8"
-os.environ["PYTHONIOENCODING"] = "utf-8"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,8 +40,7 @@ PPE_TYPES = {
 def get_conn():
     return psycopg2.connect(
         host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
-        user=DB_USER, password=DB_PASS,
-        options="-c client_encoding=UTF8"
+        user=DB_USER, password=DB_PASS
     )
 
 
