@@ -5,7 +5,7 @@ import time
 import json
 from datetime import date, timedelta, datetime
 
-import psycopg2
+import psycopg as psycopg2
 import requests
 import schedule
 
