@@ -127,33 +127,18 @@ def trainings_expiring(cur, cfg, horizon, ref_date=None):
     if ref_date is None:
         ref_date = date.today()
     v = cfg.get("training_validity_days", 365)
-
-    # Формируем placeholders для исключённых типов
     excl = tuple(ONE_TIME_TRAININGS)
     excl_ph = ",".join(["%s"] * len(excl))
 
     cur.execute(f"""
         SELECT e.full_name, t.training_type,
                MAX(t.training_date),
-               (MAX(t.training_date) + %(v)s * INTERVAL '1 day')::date
+               (MAX(t.training_date) + (%s * '1 day'::interval))::date
         FROM employees e
         JOIN trainings t ON e.employee_id = t.employee_id
         WHERE t.training_type NOT IN ({excl_ph})
         GROUP BY e.employee_id, e.full_name, t.training_type
-        HAVING (MAX(t.training_date) + %(v)s * INTERVAL '1 day')::date <= %(lim)s
-        ORDER BY 4
-    """, {"v": v, "lim": ref_date + timedelta(days=horizon), **{}} )
-
-    # psycopg2 не поддерживает смешанный стиль — передаём как список
-    cur.execute(f"""
-        SELECT e.full_name, t.training_type,
-               MAX(t.training_date),
-               (MAX(t.training_date) + %s * INTERVAL '1 day')::date
-        FROM employees e
-        JOIN trainings t ON e.employee_id = t.employee_id
-        WHERE t.training_type NOT IN ({excl_ph})
-        GROUP BY e.employee_id, e.full_name, t.training_type
-        HAVING (MAX(t.training_date) + %s * INTERVAL '1 day')::date <= %s
+        HAVING (MAX(t.training_date) + (%s * '1 day'::interval))::date <= %s
         ORDER BY 4
     """, [v] + list(excl) + [v, ref_date + timedelta(days=horizon)])
 
@@ -171,11 +156,11 @@ def medical_expiring(cur, cfg, horizon, ref_date=None):
     cur.execute("""
         SELECT e.full_name,
                MAX(m.medical_date),
-               (MAX(m.medical_date) + %s * INTERVAL '1 day')::date
+               (MAX(m.medical_date) + (%s * '1 day'::interval))::date
         FROM employees e
         JOIN medical m ON e.employee_id = m.employee_id
         GROUP BY e.employee_id, e.full_name
-        HAVING (MAX(m.medical_date) + %s * INTERVAL '1 day')::date <= %s
+        HAVING (MAX(m.medical_date) + (%s * '1 day'::interval))::date <= %s
         ORDER BY 3
     """, [v, v, ref_date + timedelta(days=horizon)])
     rows = []
@@ -194,19 +179,19 @@ def ppe_expiring(cur, cfg, horizon, ref_date=None):
         SELECT e.full_name, p.ppe_type,
                MAX(p.issue_date),
                (MAX(p.issue_date) + CASE p.ppe_type
-                   WHEN 'Каска защитная'           THEN %s * INTERVAL '1 day'
-                   WHEN 'Страховочная система'      THEN %s * INTERVAL '1 day'
-                   WHEN 'Перчатки диэлектрические'  THEN %s * INTERVAL '1 day'
-                   WHEN 'Пояс монтажный'            THEN %s * INTERVAL '1 day'
+                   WHEN 'Каска защитная'           THEN (%s * '1 day'::interval)
+                   WHEN 'Страховочная система'      THEN (%s * '1 day'::interval)
+                   WHEN 'Перчатки диэлектрические'  THEN (%s * '1 day'::interval)
+                   WHEN 'Пояс монтажный'            THEN (%s * '1 day'::interval)
                    ELSE 365 * INTERVAL '1 day' END)::date
         FROM employees e
         JOIN ppe p ON e.employee_id = p.employee_id
         GROUP BY e.employee_id, e.full_name, p.ppe_type
         HAVING (MAX(p.issue_date) + CASE p.ppe_type
-                   WHEN 'Каска защитная'           THEN %s * INTERVAL '1 day'
-                   WHEN 'Страховочная система'      THEN %s * INTERVAL '1 day'
-                   WHEN 'Перчатки диэлектрические'  THEN %s * INTERVAL '1 day'
-                   WHEN 'Пояс монтажный'            THEN %s * INTERVAL '1 day'
+                   WHEN 'Каска защитная'           THEN (%s * '1 day'::interval)
+                   WHEN 'Страховочная система'      THEN (%s * '1 day'::interval)
+                   WHEN 'Перчатки диэлектрические'  THEN (%s * '1 day'::interval)
+                   WHEN 'Пояс монтажный'            THEN (%s * '1 day'::interval)
                    ELSE 365 * INTERVAL '1 day' END)::date <= %s
         ORDER BY 4
     """, [h, ha, g, h, h, ha, g, h, ref_date + timedelta(days=horizon)])
@@ -242,8 +227,8 @@ def summary_counts(cur, cfg, ref_date=None):
         t_pr AS (
             SELECT employee_id,
                 MAX(CASE
-                    WHEN (last_date + %s * INTERVAL '1 day')::date < %s THEN 3
-                    WHEN (last_date + %s * INTERVAL '1 day')::date <= %s THEN 2
+                    WHEN (last_date + (%s * '1 day'::interval))::date < %s THEN 3
+                    WHEN (last_date + (%s * '1 day'::interval))::date <= %s THEN 2
                     ELSE 1 END) AS pr
             FROM t_max GROUP BY employee_id
         ),
@@ -254,8 +239,8 @@ def summary_counts(cur, cfg, ref_date=None):
         m_pr AS (
             SELECT employee_id,
                 CASE
-                    WHEN (last_date + %s * INTERVAL '1 day')::date < %s THEN 3
-                    WHEN (last_date + %s * INTERVAL '1 day')::date <= %s THEN 2
+                    WHEN (last_date + (%s * '1 day'::interval))::date < %s THEN 3
+                    WHEN (last_date + (%s * '1 day'::interval))::date <= %s THEN 2
                     ELSE 1 END AS pr
             FROM m_max
         ),
@@ -267,16 +252,16 @@ def summary_counts(cur, cfg, ref_date=None):
             SELECT employee_id,
                 MAX(CASE
                     WHEN (last_date + CASE ppe_type
-                        WHEN 'Каска защитная'           THEN %s * INTERVAL '1 day'
-                        WHEN 'Страховочная система'      THEN %s * INTERVAL '1 day'
-                        WHEN 'Перчатки диэлектрические'  THEN %s * INTERVAL '1 day'
-                        WHEN 'Пояс монтажный'            THEN %s * INTERVAL '1 day'
+                        WHEN 'Каска защитная'           THEN (%s * '1 day'::interval)
+                        WHEN 'Страховочная система'      THEN (%s * '1 day'::interval)
+                        WHEN 'Перчатки диэлектрические'  THEN (%s * '1 day'::interval)
+                        WHEN 'Пояс монтажный'            THEN (%s * '1 day'::interval)
                         ELSE 365 * INTERVAL '1 day' END)::date < %s THEN 3
                     WHEN (last_date + CASE ppe_type
-                        WHEN 'Каска защитная'           THEN %s * INTERVAL '1 day'
-                        WHEN 'Страховочная система'      THEN %s * INTERVAL '1 day'
-                        WHEN 'Перчатки диэлектрические'  THEN %s * INTERVAL '1 day'
-                        WHEN 'Пояс монтажный'            THEN %s * INTERVAL '1 day'
+                        WHEN 'Каска защитная'           THEN (%s * '1 day'::interval)
+                        WHEN 'Страховочная система'      THEN (%s * '1 day'::interval)
+                        WHEN 'Перчатки диэлектрические'  THEN (%s * '1 day'::interval)
+                        WHEN 'Пояс монтажный'            THEN (%s * '1 day'::interval)
                         ELSE 365 * INTERVAL '1 day' END)::date <= %s THEN 2
                     ELSE 1 END) AS pr
             FROM p_max GROUP BY employee_id
@@ -327,7 +312,7 @@ def employee_card(cur, cfg, last_name, first_name, ref_date=None):
         excl_ph = ",".join(["%s"] * len(excl))
         cur.execute(f"""
             SELECT training_type, MAX(training_date),
-                   (MAX(training_date) + %s * INTERVAL '1 day')::date
+                   (MAX(training_date) + (%s * '1 day'::interval))::date
             FROM trainings
             WHERE employee_id = %s AND training_type NOT IN ({excl_ph})
             GROUP BY training_type ORDER BY 3
@@ -339,7 +324,7 @@ def employee_card(cur, cfg, last_name, first_name, ref_date=None):
         # Медосмотр
         cur.execute("""
             SELECT MAX(medical_date),
-                   (MAX(medical_date) + %s * INTERVAL '1 day')::date
+                   (MAX(medical_date) + (%s * '1 day'::interval))::date
             FROM medical WHERE employee_id = %s
         """, [cfg.get("medical_validity_days", 365), eid])
         row = cur.fetchone()
@@ -353,10 +338,10 @@ def employee_card(cur, cfg, last_name, first_name, ref_date=None):
         cur.execute("""
             SELECT ppe_type, MAX(issue_date),
                    (MAX(issue_date) + CASE ppe_type
-                       WHEN 'Каска защитная'           THEN %s * INTERVAL '1 day'
-                       WHEN 'Страховочная система'      THEN %s * INTERVAL '1 day'
-                       WHEN 'Перчатки диэлектрические'  THEN %s * INTERVAL '1 day'
-                       WHEN 'Пояс монтажный'            THEN %s * INTERVAL '1 day'
+                       WHEN 'Каска защитная'           THEN (%s * '1 day'::interval)
+                       WHEN 'Страховочная система'      THEN (%s * '1 day'::interval)
+                       WHEN 'Перчатки диэлектрические'  THEN (%s * '1 day'::interval)
+                       WHEN 'Пояс монтажный'            THEN (%s * '1 day'::interval)
                        ELSE 365 * INTERVAL '1 day' END)::date
             FROM ppe WHERE employee_id = %s
             GROUP BY ppe_type ORDER BY 3
