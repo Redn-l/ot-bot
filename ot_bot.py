@@ -9,6 +9,16 @@ import psycopg as psycopg2
 import requests
 import schedule
 
+# ML-зависимости (опциональные)
+ML_AVAILABLE = False
+try:
+    import numpy as np
+    import pandas as pd
+    from sklearn.ensemble import RandomForestClassifier
+    ML_AVAILABLE = True
+except ImportError:
+    pass
+
 os.environ["PGCLIENTENCODING"] = "UTF8"
 os.environ["PYTHONIOENCODING"] = "utf-8"
 
