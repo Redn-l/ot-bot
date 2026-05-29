@@ -437,42 +437,50 @@ def _build_dataset(conn):
     excl = tuple(ONE_TIME_TRAININGS)
     excl_ph = ",".join(["%s"] * len(excl))
 
-    # Инструктажи
+    # Инструктажи — двухуровневый CTE: сначала MAX, потом CASE
     cur.execute(f"""
-        SELECT employee_id,
-               MAX(CASE WHEN (MAX(training_date) + %s * '1 day'::interval)::date < %s
-                        THEN 1 ELSE 0 END) AS flag_training_expired
-        FROM (
-            SELECT employee_id, training_type, MAX(training_date) AS training_date
+        WITH t_max AS (
+            SELECT employee_id, MAX(training_date) AS last_date
             FROM trainings
             WHERE training_type NOT IN ({excl_ph})
             GROUP BY employee_id, training_type
-        ) t
-        GROUP BY employee_id
-    """, [vt, today] + list(excl))
+        )
+        SELECT employee_id,
+               MAX(CASE WHEN (last_date + (%s * '1 day'::interval))::date < %s
+                        THEN 1 ELSE 0 END) AS flag_training_expired
+        FROM t_max GROUP BY employee_id
+    """, list(excl) + [vt, today])
     train_flags = {r[0]: r[1] for r in cur.fetchall()}
 
     # Медосмотры
     cur.execute("""
+        WITH m_max AS (
+            SELECT employee_id, MAX(medical_date) AS last_date
+            FROM medical GROUP BY employee_id
+        )
         SELECT employee_id,
-               CASE WHEN (MAX(medical_date) + %s * '1 day'::interval)::date < %s
+               CASE WHEN (last_date + (%s * '1 day'::interval))::date < %s
                     THEN 1 ELSE 0 END AS flag_medical_expired
-        FROM medical GROUP BY employee_id
+        FROM m_max
     """, [vm, today])
     med_flags = {r[0]: r[1] for r in cur.fetchall()}
 
-    # СИЗ
+    # СИЗ — MAX по типу отдельно, CASE снаружи
     cur.execute("""
+        WITH p_max AS (
+            SELECT employee_id, ppe_type, MAX(issue_date) AS last_date
+            FROM ppe GROUP BY employee_id, ppe_type
+        )
         SELECT employee_id,
                MAX(CASE
-                   WHEN (MAX(issue_date) + CASE ppe_type
-                       WHEN 'Каска защитная'           THEN %s * '1 day'::interval
-                       WHEN 'Страховочная система'      THEN %s * '1 day'::interval
-                       WHEN 'Перчатки диэлектрические'  THEN %s * '1 day'::interval
-                       WHEN 'Пояс монтажный'            THEN %s * '1 day'::interval
+                   WHEN (last_date + CASE ppe_type
+                       WHEN 'Каска защитная'           THEN (%s * '1 day'::interval)
+                       WHEN 'Страховочная система'      THEN (%s * '1 day'::interval)
+                       WHEN 'Перчатки диэлектрические'  THEN (%s * '1 day'::interval)
+                       WHEN 'Пояс монтажный'            THEN (%s * '1 day'::interval)
                        ELSE 365 * '1 day'::interval END)::date < %s
                    THEN 1 ELSE 0 END) AS flag_ppe_expired
-        FROM ppe GROUP BY employee_id, ppe_type
+        FROM p_max GROUP BY employee_id
     """, [h, ha, g, h, today])
     ppe_flags = {r[0]: r[1] for r in cur.fetchall()}
 
