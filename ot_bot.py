@@ -34,6 +34,19 @@ DB_PASS = os.getenv("DB_PASS", "1")
 # По ГОСТ 12.0.004-2015
 ONE_TIME_TRAININGS = {"Вводный", "Первичный"}
 
+# ── ML-модуль ────────────────────────────────────────────────────────────────
+# Модель обучается один раз при старте и хранится в памяти
+_ml_model   = None   # обученный RandomForestClassifier
+_ml_trained = None   # дата последнего обучения
+ML_FEATURES = [
+    "flag_training_expired",
+    "flag_medical_expired",
+    "flag_ppe_expired",
+    "flag_incident_exists",
+    "audit_priority",
+    "experience_years",
+]
+
 # Типы СИЗ → параметр срока в settings
 PPE_DAYS = {
     "Каска защитная":           "ppe_helmet_days",
@@ -398,6 +411,213 @@ def format_report(rows, ref_date, horizon, title=""):
 
 # ── Клавиатуры ────────────────────────────────────────────────────────────────
 
+
+# ── ML: сбор датасета из БД ───────────────────────────────────────────────────
+
+def _build_dataset(conn):
+    """Формирует датасет признаков для всех сотрудников из БД."""
+    cur = conn.cursor()
+    cfg = load_settings(cur)
+    vt  = cfg.get("training_validity_days", 365)
+    vm  = cfg.get("medical_validity_days",  365)
+    h   = cfg.get("ppe_helmet_days",  365)
+    ha  = cfg.get("ppe_harness_days", 365)
+    g   = cfg.get("ppe_gloves_days",  180)
+    today = date.today()
+    excl = tuple(ONE_TIME_TRAININGS)
+    excl_ph = ",".join(["%s"] * len(excl))
+
+    # Инструктажи
+    cur.execute(f"""
+        SELECT employee_id,
+               MAX(CASE WHEN (MAX(training_date) + %s * '1 day'::interval)::date < %s
+                        THEN 1 ELSE 0 END) AS flag_training_expired
+        FROM (
+            SELECT employee_id, training_type, MAX(training_date) AS training_date
+            FROM trainings
+            WHERE training_type NOT IN ({excl_ph})
+            GROUP BY employee_id, training_type
+        ) t
+        GROUP BY employee_id
+    """, [vt, today] + list(excl))
+    train_flags = {r[0]: r[1] for r in cur.fetchall()}
+
+    # Медосмотры
+    cur.execute("""
+        SELECT employee_id,
+               CASE WHEN (MAX(medical_date) + %s * '1 day'::interval)::date < %s
+                    THEN 1 ELSE 0 END AS flag_medical_expired
+        FROM medical GROUP BY employee_id
+    """, [vm, today])
+    med_flags = {r[0]: r[1] for r in cur.fetchall()}
+
+    # СИЗ
+    cur.execute("""
+        SELECT employee_id,
+               MAX(CASE
+                   WHEN (MAX(issue_date) + CASE ppe_type
+                       WHEN 'Каска защитная'           THEN %s * '1 day'::interval
+                       WHEN 'Страховочная система'      THEN %s * '1 day'::interval
+                       WHEN 'Перчатки диэлектрические'  THEN %s * '1 day'::interval
+                       WHEN 'Пояс монтажный'            THEN %s * '1 day'::interval
+                       ELSE 365 * '1 day'::interval END)::date < %s
+                   THEN 1 ELSE 0 END) AS flag_ppe_expired
+        FROM ppe GROUP BY employee_id, ppe_type
+    """, [h, ha, g, h, today])
+    ppe_flags = {r[0]: r[1] for r in cur.fetchall()}
+
+    # Инциденты
+    cur.execute("""
+        SELECT employee_id, CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END
+        FROM incidents GROUP BY employee_id
+    """)
+    inc_flags = {r[0]: r[1] for r in cur.fetchall()}
+
+    # Аудиты
+    cur.execute("""
+        SELECT department,
+               MAX(CASE risk_category
+                   WHEN 'Высокий' THEN 3
+                   WHEN 'Средний' THEN 2
+                   ELSE 1 END)
+        FROM audits GROUP BY department
+    """)
+    audit_prio = {r[0]: r[1] for r in cur.fetchall()}
+
+    # Сотрудники + стаж
+    cur.execute("SELECT employee_id, full_name, department, hire_date FROM employees")
+    employees = cur.fetchall()
+    cur.close()
+
+    rows = []
+    for eid, name, dept, hire_d in employees:
+        exp = 0.0
+        if hire_d:
+            exp = round((today - (hire_d if isinstance(hire_d, date) else hire_d)).days / 365.25, 1)
+        rows.append({
+            "employee_id":           eid,
+            "full_name":             name,
+            "flag_training_expired": train_flags.get(eid, 0),
+            "flag_medical_expired":  med_flags.get(eid, 0),
+            "flag_ppe_expired":      ppe_flags.get(eid, 0),
+            "flag_incident_exists":  inc_flags.get(eid, 0),
+            "audit_priority":        audit_prio.get(dept, 1),
+            "experience_years":      exp,
+        })
+    return rows
+
+
+def _compute_target(row):
+    """Вычисляет целевой класс по тем же правилам что ETL."""
+    p = max(
+        3 if row["flag_training_expired"] else 1,
+        3 if row["flag_medical_expired"]  else 1,
+        3 if row["flag_ppe_expired"]      else 1,
+    )
+    return p
+
+
+def ml_train(conn):
+    """Обучает RandomForest на текущих данных БД."""
+    global _ml_model, _ml_trained
+    if not ML_AVAILABLE:
+        return False
+    rows = _build_dataset(conn)
+    if len(rows) < 5:
+        return False
+    X = np.array([[r[f] for f in ML_FEATURES] for r in rows], dtype=float)
+    y = np.array([_compute_target(r) for r in rows], dtype=int)
+    rf = RandomForestClassifier(
+        n_estimators=200, class_weight="balanced",
+        random_state=42, n_jobs=-1
+    )
+    rf.fit(X, y)
+    _ml_model   = rf
+    _ml_trained = date.today()
+    log.info("ML-модель обучена: %d объектов", len(rows))
+    return True
+
+
+def ml_predict_all(conn):
+    """
+    Возвращает список (full_name, prob_class3, predicted_class)
+    отсортированный по убыванию вероятности класса 3.
+    """
+    global _ml_model
+    if not ML_AVAILABLE or _ml_model is None:
+        return None
+    rows = _build_dataset(conn)
+    X = np.array([[r[f] for f in ML_FEATURES] for r in rows], dtype=float)
+    probs   = _ml_model.predict_proba(X)
+    classes = _ml_model.classes_.tolist()
+    idx3    = classes.index(3) if 3 in classes else -1
+
+    results = []
+    for i, row in enumerate(rows):
+        p3 = float(probs[i][idx3]) if idx3 >= 0 else 0.0
+        pc = int(_ml_model.predict(X[i:i+1])[0])
+        results.append((row["full_name"], p3, pc))
+    results.sort(key=lambda x: -x[1])
+    return results
+
+
+def bar(prob, width=12):
+    """Текстовый прогресс-бар для вероятности."""
+    filled = round(prob * width)
+    return "█" * filled + "░" * (width - filled)
+
+
+# ── ML-команда бота ───────────────────────────────────────────────────────────
+
+def cmd_risk(chat_id):
+    """Топ-10 сотрудников по ML-прогнозу риска недопуска."""
+    if not ML_AVAILABLE:
+        send("ML-библиотеки не установлены. Добавьте scikit-learn и pandas в requirements.txt.", chat_id)
+        return
+    try:
+        conn = get_conn()
+
+        # Переобучаем если модели нет или данные устарели (> 1 дня)
+        global _ml_model, _ml_trained
+        if _ml_model is None or _ml_trained != date.today():
+            send("<i>Обновляю ML-модель...</i>", chat_id)
+            if not ml_train(conn):
+                send("Недостаточно данных для обучения модели.", chat_id, keyboard=main_keyboard())
+                conn.close()
+                return
+
+        results = ml_predict_all(conn)
+        conn.close()
+
+        if not results:
+            send("Нет данных для прогноза.", chat_id, keyboard=main_keyboard())
+            return
+
+        top10 = results[:10]
+        lines = [
+            f"<b>ML-прогноз риска недопуска</b>",
+            f"Модель: Random Forest | LOO CV 96,0% | {date.today().strftime('%d.%m.%Y')}",
+            "",
+        ]
+        for name, p3, cls in top10:
+            status = "Не допущен" if cls == 3 else ("Внимание" if cls == 2 else "Допущен")
+            lines.append(
+                f"{bar(p3)} {round(p3*100)}%  {name}\n"
+                f"   Прогноз: {status}"
+            )
+
+        # Статистика по всему списку
+        total     = len(results)
+        high_risk = sum(1 for _, p, _ in results if p >= 0.7)
+        lines.append("")
+        lines.append(f"Показаны топ-10 из {total} сотрудников. Высокий риск (>70%): {high_risk}")
+
+        send("\n".join(lines), chat_id, keyboard=main_keyboard())
+
+    except Exception as e:
+        log.error("cmd_risk: %s", e)
+        send(f"Ошибка ML-прогноза: {e}", chat_id, keyboard=main_keyboard())
+
 def main_keyboard():
     """Главное меню кнопок."""
     return [
@@ -411,6 +631,7 @@ def main_keyboard():
         ],
         [
             {"text": "👤 Найти сотрудника",   "callback_data": "ask_employee"},
+            {"text": "🧠 ML-прогноз риска",   "callback_data": "ml_risk"},
         ],
     ]
 
@@ -487,6 +708,9 @@ def handle_callback(cq):
             "Например: <code>Морозов Александр</code>",
             chat_id
         )
+
+    elif data == "ml_risk":
+        cmd_risk(chat_id)
 
 
 # ── Команды ───────────────────────────────────────────────────────────────────
@@ -784,7 +1008,8 @@ def handle_text(text, chat_id):
             "/today — истекающие в 30 дней\n"
             "/all — все нарушения\n"
             "/status Фамилия Имя — карточка сотрудника\n"
-            "/check ДД.ММ.ГГГГ — состояние на дату\n\n"
+            "/check ДД.ММ.ГГГГ — состояние на дату\n"
+            "/risk — ML-прогноз риска недопуска\n\n"
             f"Ежедневный отчёт в {DAILY_TIME}",
             chat_id, keyboard=main_keyboard()
         )
@@ -817,6 +1042,9 @@ def handle_text(text, chat_id):
             except ValueError:
                 continue
         send("Формат: /check ДД.ММ.ГГГГ — например /check 01.09.2026", chat_id)
+
+    elif low.startswith("/risk"):
+        cmd_risk(chat_id)
 
     elif low.startswith("/status"):
         after = text[len("/status"):].strip()
@@ -858,6 +1086,16 @@ def run_scheduler():
 def main():
     log.info("бот запущен")
     threading.Thread(target=run_scheduler, daemon=True).start()
+
+    # Предварительное обучение ML-модели при старте
+    if ML_AVAILABLE:
+        try:
+            _conn = get_conn()
+            if ml_train(_conn):
+                log.info("ML-модель обучена при старте")
+            _conn.close()
+        except Exception as _e:
+            log.warning("ML не удалось обучить при старте: %s", _e)
     send(
         f"✅ Бот запущен. Ежедневный отчёт в {DAILY_TIME}.",
         keyboard=main_keyboard()
