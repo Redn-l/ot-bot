@@ -4,3 +4,4 @@ schedule==1.2.1
 scikit-learn
 pandas
 numpy
+openpyxl
