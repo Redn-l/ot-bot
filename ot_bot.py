@@ -8,6 +8,7 @@ from datetime import date, timedelta, datetime
 import psycopg as psycopg2
 import requests
 import schedule
+import io
 
 # ML-зависимости (опциональные)
 ML_AVAILABLE = False
@@ -32,7 +33,7 @@ log = logging.getLogger(__name__)
 BOT_TOKEN  = os.getenv("BOT_TOKEN",  "8351287651:AAGzfWmo_hfU8bEtZEzkOZdxBrvfNzDwevM")
 CHAT_ID    = int(os.getenv("CHAT_ID", "-5175454015"))
 ADMIN_TAG  = os.getenv("ADMIN_TAG",  "@Redn_l")
-DAILY_TIME = os.getenv("DAILY_TIME", "09:00")
+DAILY_TIME = os.getenv("DAILY_TIME", "06:00")  # UTC — соответствует 09:00 МСК (UTC+3)
 
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = int(os.getenv("DB_PORT", "5434"))
@@ -636,6 +637,231 @@ def cmd_risk(chat_id):
         log.error("cmd_risk: %s", e)
         send(f"Ошибка ML-прогноза: {e}", chat_id, keyboard=main_keyboard())
 
+
+# ── Отправка файла в Telegram ─────────────────────────────────────────────────
+
+def send_document(file_bytes, filename, caption, chat_id=None):
+    """Отправить файл в Telegram-чат."""
+    if chat_id is None:
+        chat_id = CHAT_ID
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
+    try:
+        r = requests.post(
+            url,
+            data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
+            files={"document": (filename, file_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+            timeout=30
+        )
+        if not r.ok:
+            log.error("send_document %s: %s", r.status_code, r.text[:200])
+    except Exception as e:
+        log.error("send_document error: %s", e)
+
+
+def build_excel_report(conn, ref_date=None):
+    """
+    Формирует Excel-отчёт с тремя листами:
+    1. Сводка — итоговые статусы всех сотрудников
+    2. Нарушения — просроченные и истекающие документы
+    3. ML-прогноз — топ-20 сотрудников по риску (если модель доступна)
+    Возвращает bytes.
+    """
+    if not ML_AVAILABLE:
+        raise ImportError("pandas не установлен")
+
+    if ref_date is None:
+        ref_date = date.today()
+
+    cfg  = load_settings(conn.cursor())
+    cur  = conn.cursor()
+
+    # ── Лист 1: Сводка по сотрудникам ────────────────────────────────
+    vt = cfg.get("training_validity_days", 365)
+    vm = cfg.get("medical_validity_days", 365)
+    h  = cfg.get("ppe_helmet_days", 365)
+    ha = cfg.get("ppe_harness_days", 365)
+    g  = cfg.get("ppe_gloves_days", 180)
+    wd = cfg.get("expiring_notification_days", 30)
+    warn = ref_date + timedelta(days=wd)
+    excl = tuple(ONE_TIME_TRAININGS)
+    excl_ph = ",".join(["%s"] * len(excl))
+
+    # Инструктажи
+    cur.execute(f"""
+        WITH t_max AS (
+            SELECT employee_id, MAX(training_date) AS last_date
+            FROM trainings WHERE training_type NOT IN ({excl_ph})
+            GROUP BY employee_id, training_type
+        )
+        SELECT employee_id,
+               MAX(CASE WHEN (last_date + (%s * '1 day'::interval))::date < %s THEN 3
+                        WHEN (last_date + (%s * '1 day'::interval))::date <= %s THEN 2
+                        ELSE 1 END) AS p_train
+        FROM t_max GROUP BY employee_id
+    """, list(excl) + [vt, ref_date, vt, warn])
+    p_train = {r[0]: r[1] for r in cur.fetchall()}
+
+    # Медосмотры
+    cur.execute("""
+        WITH m AS (SELECT employee_id, MAX(medical_date) AS d FROM medical GROUP BY employee_id)
+        SELECT employee_id,
+               CASE WHEN (d + (%s*'1 day'::interval))::date < %s THEN 3
+                    WHEN (d + (%s*'1 day'::interval))::date <= %s THEN 2 ELSE 1 END
+        FROM m
+    """, [vm, ref_date, vm, warn])
+    p_med = {r[0]: r[1] for r in cur.fetchall()}
+
+    # СИЗ
+    cur.execute("""
+        WITH pm AS (SELECT employee_id, ppe_type, MAX(issue_date) AS d FROM ppe GROUP BY employee_id, ppe_type)
+        SELECT employee_id,
+               MAX(CASE WHEN (d + CASE ppe_type
+                   WHEN 'Каска защитная'           THEN (%s*'1 day'::interval)
+                   WHEN 'Страховочная система'      THEN (%s*'1 day'::interval)
+                   WHEN 'Перчатки диэлектрические'  THEN (%s*'1 day'::interval)
+                   WHEN 'Пояс монтажный'            THEN (%s*'1 day'::interval)
+                   ELSE 365*'1 day'::interval END)::date < %s THEN 3
+                    WHEN (d + CASE ppe_type
+                   WHEN 'Каска защитная'           THEN (%s*'1 day'::interval)
+                   WHEN 'Страховочная система'      THEN (%s*'1 day'::interval)
+                   WHEN 'Перчатки диэлектрические'  THEN (%s*'1 day'::interval)
+                   WHEN 'Пояс монтажный'            THEN (%s*'1 day'::interval)
+                   ELSE 365*'1 day'::interval END)::date <= %s THEN 2 ELSE 1 END)
+        FROM pm GROUP BY employee_id
+    """, [h, ha, g, h, ref_date, h, ha, g, h, warn])
+    p_ppe = {r[0]: r[1] for r in cur.fetchall()}
+
+    cur.execute("SELECT employee_id, full_name, department, position, brigade_id FROM employees ORDER BY department, full_name")
+    employees = cur.fetchall()
+    cur.close()
+
+    status_map = {1: "Допущен", 2: "Требует внимания", 3: "Не допущен"}
+
+    rows_summary = []
+    for eid, name, dept, pos, brig in employees:
+        pt = p_train.get(eid, 1)
+        pm = p_med.get(eid, 1)
+        pp = p_ppe.get(eid, 1)
+        fp = max(pt, pm, pp)
+        rows_summary.append({
+            "ФИО": name,
+            "Подразделение": dept,
+            "Должность": pos,
+            "Инструктажи": status_map[pt],
+            "Медосмотр": status_map[pm],
+            "СИЗ": status_map[pp],
+            "Итоговый статус": status_map[fp],
+        })
+
+    df_summary = pd.DataFrame(rows_summary)
+
+    # ── Лист 2: Детали нарушений и истекающих ────────────────────────
+    cur2 = conn.cursor()
+    rows_details = []
+
+    # Инструктажи
+    cur2.execute(f"""
+        WITH t_max AS (
+            SELECT employee_id, training_type, MAX(training_date) AS last_date
+            FROM trainings WHERE training_type NOT IN ({excl_ph})
+            GROUP BY employee_id, training_type
+        )
+        SELECT e.full_name, e.department, t.training_type, t.last_date,
+               (t.last_date + (%s*'1 day'::interval))::date AS expiry,
+               ((t.last_date + (%s*'1 day'::interval))::date - %s) AS days_left
+        FROM t_max t JOIN employees e ON e.employee_id = t.employee_id
+        WHERE (t.last_date + (%s*'1 day'::interval))::date <= %s
+        ORDER BY expiry
+    """, list(excl) + [vt, vt, ref_date, vt, warn])
+    for row in cur2.fetchall():
+        rows_details.append({
+            "ФИО": row[0], "Подразделение": row[1],
+            "Тип документа": f"Инструктаж — {row[2]}",
+            "Дата прохождения": row[3].strftime("%d.%m.%Y"),
+            "Действует до": row[4].strftime("%d.%m.%Y"),
+            "Дней до истечения": int(row[5]),
+            "Статус": "Просрочено" if int(row[5]) < 0 else "Истекает",
+        })
+
+    # Медосмотры
+    cur2.execute("""
+        WITH m AS (SELECT employee_id, MAX(medical_date) AS d FROM medical GROUP BY employee_id)
+        SELECT e.full_name, e.department, m.d,
+               (m.d + (%s*'1 day'::interval))::date,
+               ((m.d + (%s*'1 day'::interval))::date - %s)
+        FROM m JOIN employees e ON e.employee_id = m.employee_id
+        WHERE (m.d + (%s*'1 day'::interval))::date <= %s
+        ORDER BY 4
+    """, [vm, vm, ref_date, vm, warn])
+    for row in cur2.fetchall():
+        rows_details.append({
+            "ФИО": row[0], "Подразделение": row[1],
+            "Тип документа": "Медосмотр",
+            "Дата прохождения": row[2].strftime("%d.%m.%Y"),
+            "Действует до": row[3].strftime("%d.%m.%Y"),
+            "Дней до истечения": int(row[4]),
+            "Статус": "Просрочено" if int(row[4]) < 0 else "Истекает",
+        })
+
+    cur2.close()
+    df_details = pd.DataFrame(rows_details) if rows_details else pd.DataFrame(
+        columns=["ФИО","Подразделение","Тип документа","Дата прохождения","Действует до","Дней до истечения","Статус"]
+    )
+
+    # ── Лист 3: ML-прогноз ───────────────────────────────────────────
+    ml_rows = []
+    if ML_AVAILABLE and _ml_model is not None:
+        results = ml_predict_all(conn)
+        if results:
+            for name, p3, cls in results[:20]:
+                ml_rows.append({
+                    "ФИО": name,
+                    "Вероятность недопуска, %": round(p3 * 100, 1),
+                    "Прогноз": {3: "Не допущен", 2: "Требует внимания", 1: "Допущен"}.get(cls, "—"),
+                })
+    df_ml = pd.DataFrame(ml_rows) if ml_rows else pd.DataFrame(
+        columns=["ФИО", "Вероятность недопуска, %", "Прогноз"]
+    )
+
+    # ── Запись в Excel в памяти ───────────────────────────────────────
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df_summary.to_excel(writer, sheet_name="Сводка", index=False)
+        df_details.to_excel(writer, sheet_name="Нарушения", index=False)
+        df_ml.to_excel(writer, sheet_name="ML-прогноз", index=False)
+    buf.seek(0)
+    return buf.read()
+
+
+def cmd_report(chat_id, ref_date=None):
+    """Сформировать и отправить Excel-отчёт."""
+    if not ML_AVAILABLE:
+        send(
+            "Для формирования отчёта необходим pandas. "
+            "Добавьте pandas и openpyxl в requirements.txt.",
+            chat_id, keyboard=main_keyboard()
+        )
+        return
+    try:
+        send("<i>Формирую отчёт...</i>", chat_id)
+        conn = get_conn()
+
+        if ref_date is None:
+            ref_date = date.today()
+        file_bytes = build_excel_report(conn, ref_date)
+        conn.close()
+
+        date_str   = ref_date.strftime("%d.%m.%Y")
+        filename   = f"OT_report_{ref_date.strftime('%Y%m%d')}.xlsx"
+        caption    = (
+            f"<b>Отчёт по охране труда — {date_str}</b>\n"
+            f"Листы: Сводка | Нарушения | ML-прогноз"
+        )
+        send_document(file_bytes, filename, caption, chat_id)
+    except Exception as e:
+        log.error("cmd_report: %s", e)
+        send(f"Ошибка формирования отчёта: {e}", chat_id, keyboard=main_keyboard())
+
 def main_keyboard():
     """Главное меню кнопок."""
     return [
@@ -650,6 +876,9 @@ def main_keyboard():
         [
             {"text": "👤 Найти сотрудника",   "callback_data": "ask_employee"},
             {"text": "🧠 ML-прогноз риска",   "callback_data": "ml_risk"},
+        ],
+        [
+            {"text": "📥 Скачать отчёт Excel", "callback_data": "get_report"},
         ],
     ]
 
@@ -729,6 +958,9 @@ def handle_callback(cq):
 
     elif data == "ml_risk":
         cmd_risk(chat_id)
+
+    elif data == "get_report":
+        cmd_report(chat_id)
 
 
 # ── Команды ───────────────────────────────────────────────────────────────────
@@ -1027,7 +1259,9 @@ def handle_text(text, chat_id):
             "/all — все нарушения\n"
             "/status Фамилия Имя — карточка сотрудника\n"
             "/check ДД.ММ.ГГГГ — состояние на дату\n"
-            "/risk — ML-прогноз риска недопуска\n\n"
+            "/risk — ML-прогноз риска недопуска\n"
+            "/report — скачать отчёт Excel (текущая дата)\n"
+            "/report ДД.ММ.ГГГГ — отчёт на дату\n\n"
             f"Ежедневный отчёт в {DAILY_TIME}",
             chat_id, keyboard=main_keyboard()
         )
@@ -1063,6 +1297,22 @@ def handle_text(text, chat_id):
 
     elif low.startswith("/risk"):
         cmd_risk(chat_id)
+
+    elif low.startswith("/report"):
+        # /report или /report ДД.ММ.ГГГГ
+        parts = text.split(maxsplit=1)
+        if len(parts) > 1:
+            for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
+                try:
+                    ref = datetime.strptime(parts[1].strip(), fmt).date()
+                    cmd_report(chat_id, ref)
+                    break
+                except ValueError:
+                    continue
+            else:
+                send("Формат: /report или /report ДД.ММ.ГГГГ", chat_id)
+        else:
+            cmd_report(chat_id)
 
     elif low.startswith("/status"):
         after = text[len("/status"):].strip()
